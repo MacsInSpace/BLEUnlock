@@ -8,14 +8,14 @@ let ModelName = CBUUID(string:"2A24")
 let ExposureNotification = CBUUID(string:"FD6F")
 
 func getMACFromUUID(_ uuid: String) -> String? {
-    guard let plist = NSDictionary(contentsOfFile: "/Library/Preferences/com.apple.Bluetooth.plist") else { return nil }
+    guard let plist = NSDictionary(contentsOfFile: "/Library/Bluetooth/Library/Preferences/com.apple.MobileBluetooth.devices.plist") else { return nil }
     guard let cbcache = plist["CoreBluetoothCache"] as? NSDictionary else { return nil }
     guard let device = cbcache[uuid] as? NSDictionary else { return nil }
     return device["DeviceAddress"] as? String
 }
 
 func getNameFromMAC(_ mac: String) -> String? {
-    guard let plist = NSDictionary(contentsOfFile: "/Library/Preferences/com.apple.Bluetooth.plist") else { return nil }
+    guard let plist = NSDictionary(contentsOfFile: "/Library/Bluetooth/Library/Preferences/com.apple.MobileBluetooth.devices.plist") else { return nil }
     guard let devcache = plist["DeviceCache"] as? NSDictionary else { return nil }
     guard let device = devcache[mac] as? NSDictionary else { return nil }
     if let name = device["Name"] as? String {
