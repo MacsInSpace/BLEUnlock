@@ -15,6 +15,7 @@ private let lockNotificationID = "com.github.Skyearn.BLEUnlock.lock"
 private let updateNotificationID = "com.github.Skyearn.BLEUnlock.update"
 private let notificationKindKey = "kind"
 private let launcherBundleIDSuffix = ".Launcher"
+private let launchAgentLabel = "local.BLEUnlock"
 private let unlockLogicMenuItemKind = "unlockLogic"
 private let lockLogicMenuItemKind = "lockLogic"
 private let unlockRSSIMenuItemKind = "unlockRSSI"
@@ -2852,13 +2853,127 @@ struct DeviceMenuItemView {
         (Bundle.main.bundleIdentifier ?? currentAppBundleIdentifier) + launcherBundleIDSuffix
     }
 
-    func disableLegacyLoginItem() {
+    func launchAgentPlistURL() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(launchAgentLabel).plist")
+    }
+
+    func launchAgentJobName() -> String {
+        "gui/\(getuid())/\(launchAgentLabel)"
+    }
+
+    @discardableResult
+    func runLaunchctl(_ arguments: [String]) -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+        } catch {
+            print("launchctl failed to start: \(error.localizedDescription)")
+            return -1
+        }
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            if let msg = String(data: data, encoding: .utf8), !msg.isEmpty {
+                print("launchctl \(arguments.joined(separator: " ")): \(msg.trimmingCharacters(in: .whitespacesAndNewlines))")
+            }
+        }
+        return process.terminationStatus
+    }
+
+    func disableLegacyLauncherLoginItems() {
+        for label in [launcherBundleIdentifier()] + legacyLauncherBundleIdentifiers() {
+            _ = runLaunchctl(["disable", "gui/\(getuid())/\(label)"])
+            _ = runLaunchctl(["bootout", "gui/\(getuid())/\(label)"])
+            if #available(macOS 13.0, *) {
+                try? SMAppService.loginItem(identifier: label).unregister()
+            }
+        }
+    }
+
+    func disableSMAppServiceLoginItems() {
         disableLegacyLoginItems()
+        disableLegacyLauncherLoginItems()
         _ = SMLoginItemSetEnabled(launcherBundleIdentifier() as CFString, false)
+        if #available(macOS 13.0, *) {
+            let service = SMAppService.loginItem(identifier: launcherBundleIdentifier())
+            try? service.unregister()
+        }
+    }
+
+    func isLaunchAgentInstalled() -> Bool {
+        FileManager.default.fileExists(atPath: launchAgentPlistURL().path)
+    }
+
+    func isLaunchAgentLoaded() -> Bool {
+        runLaunchctl(["print", launchAgentJobName()]) == 0
+    }
+
+    func launchAgentProgramArguments() -> [String] {
+        ["/usr/bin/open", "-g", "-a", Bundle.main.bundleURL.path]
+    }
+
+    func bootoutLaunchAgent() {
+        _ = runLaunchctl(["bootout", launchAgentJobName()])
+    }
+
+    @discardableResult
+    func bootstrapLaunchAgent(showErrors: Bool) -> Bool {
+        bootoutLaunchAgent()
+        let status = runLaunchctl(["bootstrap", "gui/\(getuid())", launchAgentPlistURL().path])
+        if status == 0 {
+            _ = runLaunchctl(["enable", launchAgentJobName()])
+            return true
+        }
+        if isLaunchAgentLoaded() {
+            return true
+        }
+        if showErrors {
+            errorModal("Failed to register Launch at Login",
+                       info: "launchctl bootstrap failed (status \(status)). The plist was saved and should still run at next login.")
+        }
+        return false
+    }
+
+    func installLaunchAgent(showErrors: Bool) -> Bool {
+        let plist: [String: Any] = [
+            "Label": launchAgentLabel,
+            "ProgramArguments": launchAgentProgramArguments(),
+            "RunAtLoad": true,
+            "LimitLoadToSessionType": "Aqua",
+        ]
+
+        do {
+            let dir = launchAgentPlistURL().deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            try data.write(to: launchAgentPlistURL(), options: .atomic)
+            _ = bootstrapLaunchAgent(showErrors: showErrors)
+            return true
+        } catch {
+            if showErrors {
+                errorModal("Failed to update Launch at Login", info: error.localizedDescription)
+            }
+            return false
+        }
+    }
+
+    func removeLaunchAgent() {
+        bootoutLaunchAgent()
+        try? FileManager.default.removeItem(at: launchAgentPlistURL())
+    }
+
+    func disableLegacyLoginItem() {
+        disableSMAppServiceLoginItems()
     }
 
     func isLaunchAtLoginEnabled() -> Bool {
-        return prefs.bool(forKey: "launchAtLogin")
+        isLaunchAgentInstalled()
     }
 
     // Clean up ALL legacy login items: old SMLoginItemSetEnabled entries
@@ -2879,37 +2994,12 @@ struct DeviceMenuItemView {
 
     @discardableResult
     func setLaunchAtLogin(_ enabled: Bool, showErrors: Bool = true) -> Bool {
-        if #available(macOS 13.0, *) {
-            // Clean up legacy helper registrations when enabling
-            if enabled {
-                cleanupAllLegacyLoginItems()
-            }
-            // Use mainApp — registers the main app itself, no Launcher helper needed.
-            let service = SMAppService.mainApp
-            do {
-                if enabled {
-                    try service.register()
-                } else {
-                    try service.unregister()
-                    // Clean up any leftover legacy registrations on disable too
-                    cleanupAllLegacyLoginItems()
-                }
-                return true
-            } catch {
-                if showErrors {
-                    errorModal("Failed to update Launch at Login", info: error.localizedDescription)
-                } else {
-                    print("Launch at Login update failed: \(error.localizedDescription)")
-                }
-                return false
-            }
+        disableSMAppServiceLoginItems()
+        if enabled {
+            return installLaunchAgent(showErrors: showErrors)
         }
-
-        let ok = SMLoginItemSetEnabled(launcherBundleIdentifier() as CFString, enabled)
-        if !ok && showErrors {
-            errorModal("Failed to update Launch at Login")
-        }
-        return ok
+        removeLaunchAgent()
+        return true
     }
 
     func applicationDidFinishLaunching(_ aNotification: Notification) {
@@ -2919,14 +3009,12 @@ struct DeviceMenuItemView {
         }
         // Clean up all legacy login items and sync pref with actual registration state.
         smdQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.cleanupAllLegacyLoginItems()
-            if #available(macOS 13.0, *) {
-                let status = SMAppService.mainApp.status
-                let registered = (status == .enabled || status == .requiresApproval)
-                if registered != self.prefs.bool(forKey: "launchAtLogin") {
-                    self.prefs.set(registered, forKey: "launchAtLogin")
-                }
+            self?.disableSMAppServiceLoginItems()
+            guard let self else { return }
+            if self.isLaunchAgentInstalled() {
+                _ = self.bootstrapLaunchAgent(showErrors: false)
+            } else if self.prefs.bool(forKey: "launchAtLogin") {
+                _ = self.setLaunchAtLogin(true, showErrors: false)
             }
         }
 
