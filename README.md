@@ -5,7 +5,9 @@
 ![CI](https://github.com/Skyearn/BLEUnlock/workflows/CI/badge.svg)
 ![Github All Releases](https://img.shields.io/github/downloads/Skyearn/BLEUnlock/total.svg)
 
-BLEUnlock is a small menu bar utility that locks and unlocks your Mac by proximity of your iPhone, Apple Watch, or any other Bluetooth Low Energy device.
+BLEUnlock is a small menu bar utility that locks and unlocks your Mac by proximity of your iPhone, Apple Watch, **Android phone, Wear OS watch**, or any other Bluetooth Low Energy device.
+
+> **New: Android and Wear OS support.** Install the small [BLEUnlock Companion](#android-phones-and-wear-os-watches) app on a Pixel or other Android phone or watch, scan a QR code, and it works like an iPhone does, even while the phone is asleep in your pocket. The unlock is protected by a signed challenge, so a copied Bluetooth signal can't unlock your Mac.
 
 This document is also available in [Japanese (日本語版はこちら)](README.ja.md) and [Simplified Chinese (简体中文)](README.cn.md).
 
@@ -14,6 +16,7 @@ This document is also available in [Japanese (日本語版はこちら)](README.
 ## Features
 
 - No iPhone app is required
+- **Android and Wear OS** via an optional companion app: works through rotating Bluetooth addresses and phone sleep, and every unlock requires a cryptographic challenge answered by your device
 - Works with any BLE devices that periodically transmits signal from [static MAC address](#notes-on-mac-address)
 - Unlocks your Mac for you when the BLE device is near your Mac, without entering password
 - Locks your Mac when the BLE device is away from your Mac
@@ -35,6 +38,8 @@ BLEUnlock identifies your device by its BLE MAC address and determines proximity
 3. Approach your Mac with the forged signal to trigger an automatic unlock
 
 This is inherent to all RSSI-based proximity solutions. There is no cryptographic authentication in the BLE broadcast layer.
+
+**Android companion devices are not affected by this.** They are identified by a token that changes every 10 minutes and can only be made with the pairing key. Before every unlock, BLEUnlock sends a random challenge that the device must sign with that key, so a recorded or spoofed signal cannot unlock your Mac. The key never leaves Android Keystore on the device.
 
 Additionally, because BLEUnlock does not require installing companion software on the monitored device, it cannot determine whether the device itself is locked or unlocked. If your device is lost and picked up by someone else, that person can carry it near your Mac to trigger an automatic unlock — the Mac only sees the BLE signal, not the device's lock state.
 
@@ -92,6 +97,21 @@ It will be stored safely in Keychain.
 Finally, from the menu bar icon, select *Device*.
 It starts scanning nearby BLE devices.
 Select your device, and you're done!
+
+## Android phones and Wear OS watches
+
+Android phones change their Bluetooth address every few minutes and go quiet when asleep, so on their own they can't be tracked reliably. The **BLEUnlock Companion** app fixes that. It keeps a small, battery-friendly Bluetooth beacon running that BLEUnlock recognises whatever address the phone is using, and it answers a signed challenge before each unlock.
+
+1. Install the companion APK on your phone (Android 12 or later) from the [Releases](../../releases) page, or build it from [`companion-android/`](companion-android/).
+2. On the Mac, choose **Android Companion…** → **Pair New…** from the BLEUnlock menu. A QR code appears.
+3. On the phone, open **BLEUnlock Companion** → **Scan pairing QR from Mac**, then click **Done** on the Mac.
+
+That's it: the phone is monitored right away, and the Mac unlocks once the phone signs the challenge.
+
+- **Wear OS watches** (e.g. Pixel Watch, Wear OS 4 or later) are paired over Wi-Fi adb. The watch stops counting as present when you take it off your wrist. See [`companion-android/README.md`](companion-android/README.md).
+- You can pair several devices, for example a phone and a watch; any one of them can unlock.
+- The phone does **not** need to be paired with the Mac in Bluetooth settings. If it is and connections are slow, forget it there.
+- The companion app is about 1 MB and runs as a low-priority foreground service. Check its battery use after a day in Settings → Battery.
 
 ## Options
 
