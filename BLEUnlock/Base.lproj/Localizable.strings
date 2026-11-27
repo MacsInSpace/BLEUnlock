@@ -69,3 +69,16 @@
 "wake_without_unlocking" = "Wake without Unlocking";
 "trigger_watch_unlock" = "Trigger Apple Watch Unlock";
 "pair_for_mac_hint" = "Pair to stabilize random address tracking →";
+"companion_menu" = "Android Companion…";
+"companion_title" = "Android Companion";
+"companion_pair_info" = "Phone: open BLEUnlock Companion, tap \"Scan pairing QR from Mac\", scan this code, then click Done.\n\nWatch: click Copy Code, run companion-android/pair-watch.sh, then click Done.\n\nThe code contains the shared secret. Do not share it.";
+"companion_name" = "Name:";
+"companion_classic" = "Paired phone:";
+"companion_classic_none" = "None (BLE only)";
+"companion_done" = "Done";
+"companion_copy" = "Copy Code";
+"companion_pair_new" = "Pair New…";
+"companion_list_info" = "Paired companions. Each phone or watch has its own key; any one of them can unlock this Mac.";
+"companion_unpair" = "Unpair";
+"companion_paired_done" = "\"%@\" is paired and now monitored. The Mac unlocks only after the phone answers a signed challenge.";
+"companion_keychain_failed" = "Could not save the pairing key to the keychain.";

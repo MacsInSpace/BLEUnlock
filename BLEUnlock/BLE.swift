@@ -420,6 +420,16 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     }
     var monitoredStates: [UUID: MonitoredDeviceState] = [:]
 
+    // MARK: Android companion
+    /// Latest CBPeripheral seen sending a verified advert, per companion virtual UUID.
+    var companionPeripherals: [UUID: CBPeripheral] = [:]
+    /// CBPeripheral identifier -> companion virtual UUID, for adverts without the scan response.
+    var companionByPeripheral: [UUID: UUID] = [:]
+    var companionChallenge: CompanionChallenge?
+    var companionVerifiedAt: TimeInterval = 0
+    let companionChallengeTimeout: TimeInterval = 10
+    let companionVerificationReuse: TimeInterval = 20
+
     // MARK: GATT info-connect throttle
     // Only one GATT device-info connection at a time to avoid BT resource
     // contention. The gate is released by real connection lifecycle events
@@ -995,6 +1005,11 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     {
         let rssi = RSSI.intValue
         guard (-126..<0).contains(rssi) else { return }
+        let now = Date().timeIntervalSince1970
+        if handleCompanionAdvert(peripheral, advertisementData: advertisementData, rssi: rssi, now: now),
+           !isMonitoring(uuid: peripheral.identifier) {
+            return
+        }
         if let state = monitoredStates[peripheral.identifier], !monitoringSuspended {
             state.peripheral = peripheral
             updateMonitoredState(state, rssi: rssi)
@@ -1174,6 +1189,10 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         didConnect peripheral: CBPeripheral)
     {
         peripheral.delegate = self
+        if let ch = companionChallenge, ch.peripheral.identifier == peripheral.identifier {
+            peripheral.discoverServices([CompanionServiceUUID])
+            return
+        }
         if scanMode {
             peripheral.discoverServices([DeviceInformation])
         }
@@ -1193,6 +1212,10 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         didFailToConnect peripheral: CBPeripheral,
                         error: Error?)
     {
+        if let ch = companionChallenge, ch.peripheral.identifier == peripheral.identifier {
+            companionConnectFailed(ch, error: error)
+            return
+        }
         guard gattInfoConnectInProgress, currentGATTInfoPeripheralUUID == peripheral.identifier else { return }
         finishGATTInfoConnect(peripheral, outcome: .failed)
     }
@@ -1201,6 +1224,10 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                         didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?)
     {
+        if let ch = companionChallenge, ch.peripheral.identifier == peripheral.identifier {
+            ch.finish(false, reason: "disconnected: \(error?.localizedDescription ?? "-")")
+            return
+        }
         guard gattInfoConnectInProgress, currentGATTInfoPeripheralUUID == peripheral.identifier else { return }
         finishGATTInfoConnect(peripheral, outcome: .disconnected)
     }
@@ -1245,6 +1272,14 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral,
                     didDiscoverServices error: Error?) {
+        if let ch = companionChallenge, ch.peripheral.identifier == peripheral.identifier {
+            guard let svc = peripheral.services?.first(where: { $0.uuid == CompanionServiceUUID }) else {
+                ch.finish(false, reason: "service not found: \(error?.localizedDescription ?? "-")")
+                return
+            }
+            peripheral.discoverCharacteristics([CompanionChallengeUUID], for: svc)
+            return
+        }
         let isCurrentInfoConnect = gattInfoConnectInProgress && currentGATTInfoPeripheralUUID == peripheral.identifier
         if let error = error {
             if isCurrentInfoConnect {
@@ -1269,6 +1304,15 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     didDiscoverCharacteristicsFor service: CBService,
                     error: Error?)
     {
+        if service.uuid == CompanionServiceUUID, let ch = companionChallenge,
+           ch.peripheral.identifier == peripheral.identifier {
+            guard let chr = service.characteristics?.first(where: { $0.uuid == CompanionChallengeUUID }) else {
+                ch.finish(false, reason: "characteristic not found")
+                return
+            }
+            peripheral.writeValue(ch.nonce, for: chr, type: .withResponse)
+            return
+        }
         let isCurrentInfoConnect = gattInfoConnectInProgress && currentGATTInfoPeripheralUUID == peripheral.identifier
         if let error = error {
             if isCurrentInfoConnect {
@@ -1299,6 +1343,13 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?)
     {
+        if characteristic.uuid == CompanionChallengeUUID, let ch = companionChallenge,
+           ch.peripheral.identifier == peripheral.identifier {
+            if let error = error { ch.finish(false, reason: "read: \(error.localizedDescription)"); return }
+            let ok = characteristic.value != nil && characteristic.value == Companion.expectedResponse(nonce: ch.nonce, keyId: ch.config.keyId)
+            ch.finish(ok, reason: ok ? "HMAC ok" : "HMAC mismatch")
+            return
+        }
         let isInfoChar = characteristic.uuid == ManufacturerName || characteristic.uuid == ModelName
         if isInfoChar, let value = characteristic.value, let s = String(data: value, encoding: .utf8),
            let device = devices[peripheral.identifier] {
@@ -1336,7 +1387,160 @@ class BLE: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     {
         peripheral.discoverServices([DeviceInformation])
     }
+    func peripheral(_ peripheral: CBPeripheral,
+                    didWriteValueFor characteristic: CBCharacteristic,
+                    error: Error?)
+    {
+        guard characteristic.uuid == CompanionChallengeUUID, let ch = companionChallenge,
+              ch.peripheral.identifier == peripheral.identifier else { return }
+        if let error = error { ch.finish(false, reason: "write: \(error.localizedDescription)"); return }
+        peripheral.readValue(for: characteristic)
+    }
     //MARK:CBPeripheralDelegate end -
+
+    //MARK:- Android companion
+
+    /// Returns true when the advert belongs to the companion protocol (ours or not),
+    /// so it is kept out of the generic scan list.
+    func handleCompanionAdvert(_ peripheral: CBPeripheral, advertisementData: [String: Any], rssi: Int, now: TimeInterval) -> Bool {
+        let uuids = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        let serviceData = (advertisementData[CBAdvertisementDataServiceDataKey] as? [CBUUID: Data])?[CompanionServiceUUID]
+        guard uuids.contains(CompanionServiceUUID) || serviceData != nil else { return false }
+        let config: CompanionConfig?
+        if let serviceData = serviceData {
+            config = Companion.verifyAdvert(serviceData)
+        } else if let vuuid = companionByPeripheral[peripheral.identifier] {
+            // Primary advert without the scan response: trust it only for the peripheral
+            // that already presented a valid token.
+            config = Companion.config(virtualUUID: vuuid)
+        } else {
+            config = nil
+        }
+        guard let config = config else { return true }
+        let vuuid = config.virtualUUID
+        if let old = companionPeripherals[vuuid], old.identifier != peripheral.identifier {
+            companionByPeripheral[old.identifier] = nil // address rotated
+        }
+        companionPeripherals[vuuid] = peripheral
+        companionByPeripheral[peripheral.identifier] = vuuid
+
+        if let state = monitoredStates[vuuid], !monitoringSuspended {
+            state.peripheral = peripheral
+            // Passive only: RSSI comes from adverts (~4 Hz). LE connections to a bonded
+            // phone can fail on stale keys, and the challenge handles connecting itself.
+            updateMonitoredState(state, rssi: rssi)
+        }
+        if scanMode || isMonitoring(uuid: vuuid) {
+            let isNew = devices[vuuid] == nil
+            let device = devices[vuuid] ?? Device(uuid: vuuid)
+            device.peripheral = peripheral
+            device.rssi = rssi
+            device.isVisible = true
+            device.blName = config.name
+            devices[vuuid] = device
+            DispatchQueue.main.async { [weak self] in
+                if isNew { self?.delegate?.newDevice(device: device) } else { self?.delegate?.updateDevice(device: device) }
+            }
+            resetScanTimer(device: device)
+        }
+        return true
+    }
+
+    /// The unlock needs a companion challenge when companions are the only stably close
+    /// monitored devices and none has been verified very recently.
+    func companionChallengeNeeded() -> Bool {
+        let companionUUIDs = Set(monitoredUUIDs.filter { Companion.isCompanion($0) })
+        guard !companionUUIDs.isEmpty else { return false }
+        let now = ProcessInfo.processInfo.systemUptime
+        let otherClose = monitoredUUIDs.subtracting(companionUUIDs)
+            .compactMap { monitoredStates[$0] }
+            .contains { $0.evidence.isStablyClose(now: now) }
+        if otherClose { return false }
+        return Date().timeIntervalSince1970 - companionVerifiedAt > companionVerificationReuse
+    }
+
+    /// Challenge the stably close companions, strongest signal first, until one passes.
+    func verifyCompanion(completion: @escaping (Bool) -> Void) {
+        if let pending = companionChallenge {
+            let previous = pending.completion
+            pending.completion = { ok in previous?(ok); completion(ok) }
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let candidates: [(CompanionConfig, CBPeripheral)] = Companion.configs.compactMap { c in
+            guard isMonitoring(uuid: c.virtualUUID), let state = monitoredStates[c.virtualUUID],
+                  state.evidence.isStablyClose(now: now), let p = companionPeripherals[c.virtualUUID] else { return nil }
+            return (c, p)
+        }.sorted { (monitoredStates[$0.0.virtualUUID]?.lastRSSI ?? -127) > (monitoredStates[$1.0.virtualUUID]?.lastRSSI ?? -127) }
+        runCompanionChallenges(candidates[...], completion: completion)
+    }
+
+    private func runCompanionChallenges(_ candidates: ArraySlice<(CompanionConfig, CBPeripheral)>, completion: @escaping (Bool) -> Void) {
+        guard !monitoringSuspended, centralMgr.state == .poweredOn, let (config, p) = candidates.first else {
+            print("Companion challenge: no reachable close companion")
+            completion(false)
+            return
+        }
+        let ch = CompanionChallenge(peripheral: p, config: config) { [weak self] ok in
+            guard let self = self else { return }
+            if p.state != .disconnected { self.centralMgr.cancelPeripheralConnection(p) }
+            self.companionChallenge = nil
+            if ok {
+                self.companionVerifiedAt = Date().timeIntervalSince1970
+                completion(true)
+            } else {
+                self.runCompanionChallenges(candidates.dropFirst(), completion: completion)
+            }
+        }
+        print("Companion challenge -> \(config.name)")
+        companionChallenge = ch
+        let timer = Timer(timeInterval: companionChallengeTimeout, repeats: false) { [weak ch] _ in
+            ch?.finish(false, reason: "timeout")
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        ch.timer = timer
+        p.delegate = self
+        if p.state == .connected {
+            p.discoverServices([CompanionServiceUUID])
+        } else {
+            centralMgr.connect(p, options: nil)
+        }
+    }
+
+    /// LE connect to a phone that is classic-bonded to this Mac can fail with
+    /// "Peer removed pairing information" (the Mac holds LE keys the phone lacks).
+    /// Page the phone over BR/EDR and run the same GATT challenge over that link.
+    private func companionConnectFailed(_ ch: CompanionChallenge, error: Error?) {
+        guard !ch.usedClassicFallback else {
+            ch.finish(false, reason: "connect: \(error?.localizedDescription ?? "-")")
+            return
+        }
+        ch.usedClassicFallback = true
+        var config = Companion.config(keyId: ch.config.keyId)
+        let mac = config?.classicMAC ?? getMACFromUUID(ch.peripheral.identifier.uuidString)
+        guard let mac = mac, let classic = IOBluetoothDevice(addressString: mac.replacingOccurrences(of: ":", with: "-")) else {
+            ch.finish(false, reason: "LE connect failed and no classic address known: \(error?.localizedDescription ?? "-")")
+            return
+        }
+        if config?.classicMAC == nil {
+            config?.classicMAC = mac
+            if let c = config { Companion.save(c) }
+        }
+        print("Companion LE connect failed (\(error?.localizedDescription ?? "-")); paging \(mac) over BR/EDR")
+        ch.classicDevice = classic
+        ch.onClassicConnected = { [weak self, weak ch] status in
+            guard let self = self, let ch = ch, self.companionChallenge === ch else { return }
+            guard status == kIOReturnSuccess else {
+                ch.finish(false, reason: String(format: "classic page failed 0x%x", status))
+                return
+            }
+            self.centralMgr.connect(ch.peripheral, options: nil)
+        }
+        let r = classic.openConnection(ch, withPageTimeout: 0x1F40, authenticationRequired: false)
+        if r != kIOReturnSuccess {
+            ch.finish(false, reason: String(format: "classic page error 0x%x", r))
+        }
+    }
 
     override init() {
         super.init()

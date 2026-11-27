@@ -1,4 +1,5 @@
 import Cocoa
+import CoreImage
 import CoreGraphics
 import ServiceManagement
 import UserNotifications
@@ -298,6 +299,125 @@ struct DeviceMenuItemView {
     @objc func openBluetoothSettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.BluetoothSettings")!
         NSWorkspace.shared.open(url)
+    }
+
+    func qrImage(_ text: String, size: CGFloat) -> NSImage? {
+        guard let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(Data(text.utf8), forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let output = filter.outputImage else { return nil }
+        let scale = size / output.extent.width
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let rep = NSCIImageRep(ciImage: scaled)
+        let image = NSImage(size: rep.size)
+        image.addRepresentation(rep)
+        return image
+    }
+
+    @objc func pairCompanion() {
+        let existing = Companion.configs
+        if !existing.isEmpty {
+            let alert = NSAlert()
+            alert.messageText = t("companion_title")
+            alert.informativeText = t("companion_list_info")
+            alert.window.title = "BLEUnlock"
+            let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
+            for c in existing { popup.addItem(withTitle: "\(c.name) (key \(c.keyId.hex))") }
+            alert.accessoryView = popup
+            alert.addButton(withTitle: t("companion_pair_new"))
+            alert.addButton(withTitle: t("companion_unpair"))
+            alert.addButton(withTitle: t("cancel"))
+            NSApp.activate(ignoringOtherApps: true)
+            switch alert.runModal() {
+            case .alertFirstButtonReturn:
+                break
+            case .alertSecondButtonReturn:
+                let victim = existing[popup.indexOfSelectedItem]
+                let vuuid = victim.virtualUUID
+                Companion.unpair(victim)
+                var uuids = ble.monitoredUUIDs
+                if uuids.remove(vuuid) != nil {
+                    saveMonitoredUUIDs(uuids)
+                    monitorDevices(uuids: uuids)
+                }
+                if let device = ble.devices.removeValue(forKey: vuuid) { removeDevice(device: device) }
+                return
+            default:
+                return
+            }
+        }
+
+        let (secret, pairing) = Companion.newPairing()
+        let paired: [(mac: String, name: String)] = (IOBluetoothDevice.pairedDevices() as? [IOBluetoothDevice] ?? [])
+            .compactMap { d in d.addressString.map { ($0.lowercased(), d.name ?? $0) } }
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 310))
+        let qr = NSImageView(frame: NSRect(x: 100, y: 90, width: 220, height: 220))
+        qr.image = qrImage(pairing, size: 220)
+        qr.imageScaling = .scaleProportionallyUpOrDown
+        container.addSubview(qr)
+
+        let nameLabel = NSTextField(labelWithString: t("companion_name"))
+        nameLabel.frame = NSRect(x: 0, y: 54, width: 110, height: 20)
+        let nameField = NSTextField(frame: NSRect(x: 115, y: 52, width: 305, height: 24))
+        container.addSubview(nameLabel)
+        container.addSubview(nameField)
+
+        let classicLabel = NSTextField(labelWithString: t("companion_classic"))
+        classicLabel.frame = NSRect(x: 0, y: 18, width: 110, height: 20)
+        let popup = NSPopUpButton(frame: NSRect(x: 115, y: 14, width: 305, height: 26), pullsDown: false)
+        popup.addItem(withTitle: t("companion_classic_none"))
+        var macs: [String?] = [nil]
+        for (mac, name) in paired {
+            popup.addItem(withTitle: "\(name) (\(mac.replacingOccurrences(of: "-", with: ":").uppercased()))")
+            macs.append(mac)
+        }
+        // Preselect a phone-looking paired device and use its name.
+        let isPhone: (String) -> Bool = { mac in
+            IOBluetoothDevice(addressString: mac)?.deviceClassMajor == UInt32(kBluetoothDeviceClassMajorPhone)
+        }
+        if let idx = paired.firstIndex(where: { isPhone($0.mac) }) {
+            popup.selectItem(at: idx + 1)
+            nameField.stringValue = paired[idx].name
+        } else {
+            nameField.stringValue = "Android Companion"
+        }
+        container.addSubview(classicLabel)
+        container.addSubview(popup)
+
+        while true {
+            let alert = NSAlert()
+            alert.messageText = t("companion_title")
+            alert.informativeText = t("companion_pair_info")
+            alert.window.title = "BLEUnlock"
+            alert.addButton(withTitle: t("companion_done"))
+            alert.addButton(withTitle: t("companion_copy"))
+            alert.addButton(withTitle: t("cancel"))
+            alert.accessoryView = container
+            NSApp.activate(ignoringOtherApps: true)
+            let response = alert.runModal()
+            if response == .alertSecondButtonReturn {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(pairing, forType: .string)
+                continue
+            }
+            guard response == .alertFirstButtonReturn else { return }
+            break
+        }
+
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard let config = Companion.commitPairing(secret: secret, name: name.isEmpty ? "Android Companion" : name,
+                                                   classicMAC: macs[popup.indexOfSelectedItem]) else {
+            errorModal(t("companion_title"), info: t("companion_keychain_failed"))
+            return
+        }
+        // Clear the pairing code from the pasteboard if it was copied.
+        if NSPasteboard.general.string(forType: .string) == pairing { NSPasteboard.general.clearContents() }
+        var uuids = ble.monitoredUUIDs
+        uuids.insert(config.virtualUUID)
+        saveMonitoredUUIDs(uuids)
+        monitorDevices(uuids: uuids)
+        infoModal(t("companion_title"), info: String(format: t("companion_paired_done"), config.name))
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
@@ -1780,24 +1900,42 @@ struct DeviceMenuItemView {
                 }
                 return
             }
-            guard let password = self.fetchPassword(warn: true) else { return }
-            
-            self.unlockedAt = Date().timeIntervalSince1970
-            self.fakeKeyStrokes(password)
-            self.playNowPlaying()
-            self.runScript("unlocked", device: device, deviceRSSI: deviceRSSI)
+            let performUnlock = { [weak self] in
+                guard let self = self else { return }
+                guard let password = self.fetchPassword(warn: true) else { return }
 
-            // On wake, the first attempt can land before the login UI is fully ready.
-            if (recentlyWoke || self.inScreensaver) && retryCount < self.wakeUnlockMaxRetries {
-                self.postUnlockRetryTimer?.invalidate()
-                let retryDelay = conservativeWakeUnlock ? 2.0 : 1.5
-                self.postUnlockRetryTimer = Timer.scheduledTimer(withTimeInterval: retryDelay, repeats: false, block: { [weak self] _ in
-                    guard let self = self else { return }
-                    self.postUnlockRetryTimer = nil
-                    guard self.isScreenLocked() else { return }
-                    self.scheduleWakeUnlock(after: self.wakeUnlockRetryDelay, retryCount: retryCount + 1, device: device, deviceRSSI: deviceRSSI)
-                })
+                self.unlockedAt = Date().timeIntervalSince1970
+                self.fakeKeyStrokes(password)
+                self.playNowPlaying()
+                self.runScript("unlocked", device: device, deviceRSSI: deviceRSSI)
+
+                // On wake, the first attempt can land before the login UI is fully ready.
+                if (recentlyWoke || self.inScreensaver) && retryCount < self.wakeUnlockMaxRetries {
+                    self.postUnlockRetryTimer?.invalidate()
+                    let retryDelay = conservativeWakeUnlock ? 2.0 : 1.5
+                    self.postUnlockRetryTimer = Timer.scheduledTimer(withTimeInterval: retryDelay, repeats: false, block: { [weak self] _ in
+                        guard let self = self else { return }
+                        self.postUnlockRetryTimer = nil
+                        guard self.isScreenLocked() else { return }
+                        self.scheduleWakeUnlock(after: self.wakeUnlockRetryDelay, retryCount: retryCount + 1, device: device, deviceRSSI: deviceRSSI)
+                    })
+                }
             }
+
+            // An Android companion must prove possession of the pairing key before the
+            // password is typed; a replayed advert alone can never unlock the Mac.
+            if self.ble.companionChallengeNeeded() {
+                self.ble.verifyCompanion { [weak self] ok in
+                    guard let self = self, ok else { return }
+                    guard !self.manualLock, !self.systemSleep, !self.displaySleep,
+                          self.ble.presence, self.ble.hasStableUnlockEvidence(),
+                          !self.prefs.bool(forKey: "wakeWithoutUnlocking"),
+                          self.isScreenLocked() else { return }
+                    performUnlock()
+                }
+                return
+            }
+            performUnlock()
         })
     }
 
@@ -2531,6 +2669,8 @@ struct DeviceMenuItemView {
         scanItem.isEnabled = false
         deviceMenu.addItem(scanItem)
         scanningMenuItem = scanItem
+
+        mainMenu.addItem(withTitle: t("companion_menu"), action: #selector(pairCompanion), keyEquivalent: "")
 
         let unlockSettingsItem = mainMenu.addItem(withTitle: t("unlock_settings"), action: nil, keyEquivalent: "")
         unlockSettingsItem.submenu = unlockSettingsMenu
