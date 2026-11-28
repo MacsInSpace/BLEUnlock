@@ -317,35 +317,44 @@ struct DeviceMenuItemView {
 
     @objc func pairCompanion() {
         let existing = Companion.configs
+        let alert = NSAlert()
+        alert.messageText = t("companion_title")
+        alert.informativeText = t(existing.isEmpty ? "companion_none_info" : "companion_list_info")
+        alert.window.title = "BLEUnlock"
+        let listPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
+        for c in existing { listPopup.addItem(withTitle: "\(c.name) (key \(c.keyId.hex))") }
+        if !existing.isEmpty { alert.accessoryView = listPopup }
+        alert.addButton(withTitle: t("companion_pair_new"))
+        alert.addButton(withTitle: t("companion_import"))
         if !existing.isEmpty {
-            let alert = NSAlert()
-            alert.messageText = t("companion_title")
-            alert.informativeText = t("companion_list_info")
-            alert.window.title = "BLEUnlock"
-            let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 26), pullsDown: false)
-            for c in existing { popup.addItem(withTitle: "\(c.name) (key \(c.keyId.hex))") }
-            alert.accessoryView = popup
-            alert.addButton(withTitle: t("companion_pair_new"))
+            alert.addButton(withTitle: t("companion_copy"))
             alert.addButton(withTitle: t("companion_unpair"))
-            alert.addButton(withTitle: t("cancel"))
-            NSApp.activate(ignoringOtherApps: true)
-            switch alert.runModal() {
-            case .alertFirstButtonReturn:
-                break
-            case .alertSecondButtonReturn:
-                let victim = existing[popup.indexOfSelectedItem]
-                let vuuid = victim.virtualUUID
-                Companion.unpair(victim)
-                var uuids = ble.monitoredUUIDs
-                if uuids.remove(vuuid) != nil {
-                    saveMonitoredUUIDs(uuids)
-                    monitorDevices(uuids: uuids)
-                }
-                if let device = ble.devices.removeValue(forKey: vuuid) { removeDevice(device: device) }
-                return
-            default:
-                return
+        }
+        alert.addButton(withTitle: t("cancel"))
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        switch response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue {
+        case 0:
+            break
+        case 1:
+            importCompanionCode()
+            return
+        case 2 where !existing.isEmpty:
+            copyCompanionCode(existing[listPopup.indexOfSelectedItem])
+            return
+        case 3 where !existing.isEmpty:
+            let victim = existing[listPopup.indexOfSelectedItem]
+            let vuuid = victim.virtualUUID
+            Companion.unpair(victim)
+            var uuids = ble.monitoredUUIDs
+            if uuids.remove(vuuid) != nil {
+                saveMonitoredUUIDs(uuids)
+                monitorDevices(uuids: uuids)
             }
+            if let device = ble.devices.removeValue(forKey: vuuid) { removeDevice(device: device) }
+            return
+        default:
+            return
         }
 
         let (secret, pairing) = Companion.newPairing()
@@ -414,11 +423,77 @@ struct DeviceMenuItemView {
         }
         // Clear the pairing code from the pasteboard if it was copied.
         if NSPasteboard.general.string(forType: .string) == pairing { NSPasteboard.general.clearContents() }
+        monitorCompanion(config)
+        infoModal(t("companion_title"), info: String(format: t("companion_paired_done"), config.name))
+    }
+
+    func monitorCompanion(_ config: CompanionConfig) {
         var uuids = ble.monitoredUUIDs
         uuids.insert(config.virtualUUID)
         saveMonitoredUUIDs(uuids)
         monitorDevices(uuids: uuids)
-        infoModal(t("companion_title"), info: String(format: t("companion_paired_done"), config.name))
+    }
+
+    /// Copies an existing companion's pairing code so another user account can import it.
+    /// The code is cleared from the pasteboard after two minutes if still there.
+    func copyCompanionCode(_ config: CompanionConfig) {
+        guard let code = Companion.pairingString(for: config) else {
+            errorModal(t("companion_title"), info: t("companion_keychain_read_failed"))
+            return
+        }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(code, forType: .string)
+        let change = pb.changeCount
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) {
+            if pb.changeCount == change { pb.clearContents() }
+        }
+        infoModal(t("companion_title"), info: String(format: t("companion_copied"), config.name))
+    }
+
+    /// Adds a companion from a pairing code copied in another user account (or from
+    /// the Pair New dialog), without re-pairing the phone.
+    func importCompanionCode() {
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 64))
+        let codeLabel = NSTextField(labelWithString: t("companion_code"))
+        codeLabel.frame = NSRect(x: 0, y: 40, width: 110, height: 20)
+        let codeField = PasteableTextField(frame: NSRect(x: 115, y: 38, width: 305, height: 24))
+        codeField.placeholderString = "bleunlock-companion:1:…"
+        if let clip = NSPasteboard.general.string(forType: .string), Companion.parsePairing(clip) != nil {
+            codeField.stringValue = clip
+        }
+        let nameLabel = NSTextField(labelWithString: t("companion_name"))
+        nameLabel.frame = NSRect(x: 0, y: 4, width: 110, height: 20)
+        let nameField = PasteableTextField(frame: NSRect(x: 115, y: 2, width: 305, height: 24))
+        nameField.stringValue = "Android Companion"
+        [codeLabel, codeField, nameLabel, nameField].forEach(container.addSubview)
+
+        let alert = NSAlert()
+        alert.messageText = t("companion_import_title")
+        alert.informativeText = t("companion_import_info")
+        alert.window.title = "BLEUnlock"
+        alert.accessoryView = container
+        alert.addButton(withTitle: t("companion_import_button"))
+        alert.addButton(withTitle: t("cancel"))
+        alert.window.initialFirstResponder = codeField
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        guard let secret = Companion.parsePairing(codeField.stringValue) else {
+            errorModal(t("companion_import_title"), info: t("companion_import_invalid"))
+            return
+        }
+        if NSPasteboard.general.string(forType: .string).flatMap(Companion.parsePairing) != nil {
+            NSPasteboard.general.clearContents()
+        }
+        let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard let config = Companion.commitPairing(secret: secret, name: name.isEmpty ? "Android Companion" : name,
+                                                   classicMAC: nil) else {
+            errorModal(t("companion_title"), info: t("companion_keychain_failed"))
+            return
+        }
+        monitorCompanion(config)
+        infoModal(t("companion_title"), info: String(format: t("companion_imported"), config.name))
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {

@@ -82,3 +82,13 @@
 "companion_unpair" = "Unpair";
 "companion_paired_done" = "\"%@\" is paired and now monitored. The Mac unlocks only after the phone answers a signed challenge.";
 "companion_keychain_failed" = "Could not save the pairing key to the keychain.";
+"companion_keychain_read_failed" = "Could not read the pairing key from the keychain.";
+"companion_none_info" = "Pair a new Android phone or Wear OS watch, or import the pairing code of a phone already paired in another user account on this Mac.";
+"companion_import" = "Import Code…";
+"companion_import_title" = "Import Pairing Code";
+"companion_import_info" = "Use the same phone or watch in this user account.\n\nIn the other account, open Android Companion…, select the device and click Copy Code. The clipboard is not shared between user accounts, so carry the code across yourself (for example in a file you delete afterwards), then paste it here.\n\nThe code contains the secret key. Do not share it.";
+"companion_code" = "Code:";
+"companion_import_button" = "Import";
+"companion_import_invalid" = "That is not a BLEUnlock pairing code.";
+"companion_imported" = "\"%@\" is set up in this account and now monitored.";
+"companion_copied" = "The pairing code for \"%@\" is on the clipboard and will be cleared in two minutes.\n\nIn the other user account, choose Android Companion… → Import Code… and paste it. It contains the secret key, so do not share it.";

@@ -12,6 +12,7 @@
 //   pairing  = "bleunlock-companion:1:" + base64url(K)
 
 import Foundation
+import AppKit
 import CoreBluetooth
 import CommonCrypto
 import IOBluetooth
@@ -94,10 +95,31 @@ enum Companion {
         var b = [UInt8](repeating: 0, count: 32)
         precondition(SecRandomCopyBytes(kSecRandomDefault, b.count, &b) == errSecSuccess)
         let secret = Data(b)
-        let b64 = secret.base64EncodedString()
+        return (secret, pairingString(secret: secret))
+    }
+
+    private static let pairingPrefix = "bleunlock-companion:1:"
+
+    static func pairingString(secret: Data) -> String {
+        pairingPrefix + secret.base64EncodedString()
             .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: "=", with: "")
-        return (secret, "bleunlock-companion:1:" + b64)
+    }
+
+    /// The pairing code of an existing companion, e.g. to import it in another user account.
+    static func pairingString(for c: CompanionConfig) -> String? {
+        key(c.keyId).map { pairingString(secret: $0) }
+    }
+
+    /// The 32-byte secret in a pairing code, or nil if the text is not one.
+    static func parsePairing(_ text: String) -> Data? {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.hasPrefix(pairingPrefix) else { return nil }
+        var b64 = String(t.dropFirst(pairingPrefix.count))
+            .replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        guard let d = Data(base64Encoded: b64), d.count == 32 else { return nil }
+        return d
     }
 
     @discardableResult
@@ -219,6 +241,25 @@ final class CompanionChallenge: NSObject {
         let c = completion
         completion = nil
         c?(ok)
+    }
+}
+
+/// NSTextField that handles ⌘V/⌘C/⌘X/⌘A itself: BLEUnlock has no Edit menu, so
+/// these shortcuts are not routed to text fields in its alerts otherwise.
+final class PasteableTextField: NSTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+              let key = event.charactersIgnoringModifiers else { return super.performKeyEquivalent(with: event) }
+        let action: Selector?
+        switch key {
+        case "v": action = #selector(NSText.paste(_:))
+        case "c": action = #selector(NSText.copy(_:))
+        case "x": action = #selector(NSText.cut(_:))
+        case "a": action = #selector(NSText.selectAll(_:))
+        default: action = nil
+        }
+        if let action = action, NSApp.sendAction(action, to: nil, from: self) { return true }
+        return super.performKeyEquivalent(with: event)
     }
 }
 
