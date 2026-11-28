@@ -4,6 +4,7 @@
 
 - **Feat:** Android / Wear OS companion app (`companion-android/`). The phone or watch advertises a fixed service UUID with a rotating HMAC token, so BLEUnlock tracks it regardless of BLE address rotation or the phone sleeping. Pair via **Android Companion…** (QR code). Several companions (e.g. phone + watch) can be paired.
 - **Feat:** Before unlocking for a companion, BLEUnlock sends a random challenge that the device must sign with the pairing key, so replayed adverts cannot unlock the Mac.
+- **Feat:** **Copy Code** and **Import Code…** in Android Companion… let several macOS user accounts use the same phone or watch.
 - **Fix:** Launch at Login uses a per-user LaunchAgent (launchctl bootstrap), and the Launcher helper finds the main app bundle from Contents/Library/LoginItems.
 
 
